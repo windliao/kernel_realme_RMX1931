@@ -772,7 +772,6 @@ static int pil_shutdown_trusted(struct pil_desc *pil)
 	if (rc)
 		goto err_clks;
 
-
 	if (!is_scm_armv8()) {
 		rc = scm_call(SCM_SVC_PIL, PAS_SHUTDOWN_CMD, &proc,
 				sizeof(proc), &scm_ret, sizeof(scm_ret));
@@ -850,6 +849,10 @@ static void log_failure_reason(const struct pil_tz_data *d)
 {
 	size_t size;
 	char *smem_reason, reason[MAX_SSR_REASON_LEN];
+	#ifdef OPLUS_FEATURE_AGINGTEST
+	/* Yong.Qian@bsp.kernel.stability, 2020/5/14, Add for dump reason */
+	char *function_name;
+	#endif /*OPLUS_FEATURE_AGINGTEST*/
 	const char *name = d->subsys_desc.name;
 
 	if (d->smem_id == -1)
@@ -867,6 +870,11 @@ static void log_failure_reason(const struct pil_tz_data *d)
 	}
 
 	strlcpy(reason, smem_reason, min(size, (size_t)MAX_SSR_REASON_LEN));
+	#ifdef OPLUS_FEATURE_AGINGTEST
+	/* Yong.Qian@bsp.kernel.stability, 2020/5/14, Add for dump reason */
+	function_name = parse_function_builtin_return_address((unsigned long)__builtin_return_address(0));
+	save_dump_reason_to_smem(reason, function_name);
+	#endif /*OPLUS_FEATURE_AGINGTEST*/
 	pr_err("%s subsystem failure reason: %s.\n", name, reason);
 }
 
