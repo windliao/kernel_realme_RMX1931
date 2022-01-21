@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
  */
 #include <linux/slab.h>
 #include <linux/fs.h>
@@ -9,8 +9,6 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <dsp/audio_cal_utils.h>
-
-struct mutex cal_lock;
 
 static int unmap_memory(struct cal_type_data *cal_type,
 			struct cal_block_data *cal_block);
@@ -59,6 +57,10 @@ size_t get_cal_info_size(int32_t cal_type)
 	case ADM_AUDPROC_CAL_TYPE:
 	case ADM_LSM_AUDPROC_CAL_TYPE:
 	case ADM_LSM_AUDPROC_PERSISTENT_CAL_TYPE:
+#ifdef OPLUS_ARCH_EXTENDS
+/*Zhixiong Zhang@MULTIMEDIA.AUDIODRIVER.ADSP.354056, 2020/09/08, CR 2663827 fix voicecall tx mute issue*/
+	case ADM_AUDPROC_PERSISTENT_CAL_TYPE:
+#endif /* OPLUS_ARCH_EXTENDS */
 		size = sizeof(struct audio_cal_info_audproc);
 		break;
 	case ADM_AUDVOL_CAL_TYPE:
@@ -213,6 +215,10 @@ size_t get_user_cal_type_size(int32_t cal_type)
 	case ADM_AUDPROC_CAL_TYPE:
 	case ADM_LSM_AUDPROC_CAL_TYPE:
 	case ADM_LSM_AUDPROC_PERSISTENT_CAL_TYPE:
+#ifdef OPLUS_ARCH_EXTENDS
+/*Zhixiong Zhang@MULTIMEDIA.AUDIODRIVER.ADSP.354056, 2020/09/08, CR 2663827 fix voicecall tx mute issue*/
+	case ADM_AUDPROC_PERSISTENT_CAL_TYPE:
+#endif /* OPLUS_ARCH_EXTENDS */
 		size = sizeof(struct audio_cal_type_audproc);
 		break;
 	case ADM_AUDVOL_CAL_TYPE:
@@ -940,9 +946,7 @@ int cal_utils_dealloc_cal(size_t data_size, void *data,
 	if (ret < 0)
 		goto err;
 
-	mutex_lock(&cal_lock);
 	delete_cal_block(cal_block);
-	mutex_unlock(&cal_lock);
 err:
 	mutex_unlock(&cal_type->lock);
 done:
@@ -1057,12 +1061,6 @@ void cal_utils_mark_cal_used(struct cal_block_data *cal_block)
 }
 EXPORT_SYMBOL(cal_utils_mark_cal_used);
 
-int __init cal_utils_init(void)
-{
-	mutex_init(&cal_lock);
-	return 0;
-}
-
 /**
  * cal_utils_is_cal_stale
  *
@@ -1072,19 +1070,9 @@ int __init cal_utils_init(void)
  */
 bool cal_utils_is_cal_stale(struct cal_block_data *cal_block)
 {
-	bool ret = false;
+	if ((cal_block) && (cal_block->cal_stale))
+		return true;
 
-	mutex_lock(&cal_lock);
-	if (!cal_block) {
-		pr_err("%s: cal_block is Null", __func__);
-		goto unlock;
-	}
-
-	if (cal_block->cal_stale)
-		ret = true;
-
-unlock:
-	mutex_unlock(&cal_lock);
-	return ret;
+	return false;
 }
 EXPORT_SYMBOL(cal_utils_is_cal_stale);
