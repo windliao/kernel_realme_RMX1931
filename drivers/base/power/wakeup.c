@@ -726,8 +726,9 @@ static void wakeup_source_deactivate(struct wakeup_source *ws)
 	trace_wakeup_source_deactivate(ws->name, cec);
 
 	split_counters(&cnt, &inpr);
-	if (!inpr && waitqueue_active(&wakeup_count_wait_queue))
+	if (!inpr && waitqueue_active(&wakeup_count_wait_queue)){
 		wake_up(&wakeup_count_wait_queue);
+	}
 }
 
 /**
@@ -875,7 +876,7 @@ void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
 				len += scnprintf(pending_wakeup_source, max,
 						"Pending Wakeup Sources: ");
 			len += scnprintf(pending_wakeup_source + len, max - len,
-				"%s ", ws->name);
+				"%s, %ld, %ld ", ws->name, ws->active_count, ktime_to_ms(ws->total_time));
 			active = true;
 		} else if (!active &&
 			   (!last_active_ws ||
@@ -886,8 +887,8 @@ void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
 	}
 	if (!active && last_active_ws) {
 		scnprintf(pending_wakeup_source, max,
-				"Last active Wakeup Source: %s",
-				last_active_ws->name);
+				"Last active Wakeup Source: %s, %ld, %ld",
+				last_active_ws->name, last_active_ws->active_count, ktime_to_ms(last_active_ws->total_time));
 	}
 	srcu_read_unlock(&wakeup_srcu, srcuidx);
 }
@@ -912,9 +913,10 @@ void pm_print_active_wakeup_sources(void)
 		}
 	}
 
-	if (!active && last_activity_ws)
+	if (!active && last_activity_ws) {
 		pr_debug("last active wakeup source: %s\n",
 			last_activity_ws->name);
+	}
 	srcu_read_unlock(&wakeup_srcu, srcuidx);
 }
 EXPORT_SYMBOL_GPL(pm_print_active_wakeup_sources);
@@ -1174,7 +1176,7 @@ static const struct file_operations wakeup_sources_stats_fops = {
 static int __init wakeup_sources_debugfs_init(void)
 {
 	wakeup_sources_stats_dentry = debugfs_create_file("wakeup_sources",
-			S_IRUGO, NULL, NULL, &wakeup_sources_stats_fops);
+			S_IRUGO| S_IWUGO, NULL, NULL, &wakeup_sources_stats_fops);
 	return 0;
 }
 
