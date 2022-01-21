@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2021, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -35,6 +35,12 @@
 #include <asm/cacheflush.h>
 #include <uapi/linux/sched/types.h>
 #include <soc/qcom/boot_stats.h>
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+/* 
+ * collect reserve vma use count
+ */
+#include "kgsl_reserved_area.h"
+#endif
 
 #include "kgsl.h"
 #include "kgsl_debugfs.h"
@@ -279,7 +285,6 @@ kgsl_mem_entry_create(void)
 		kref_init(&entry->refcount);
 		/* put this ref in userspace memory alloc and map ioctls */
 		kref_get(&entry->refcount);
-		atomic_set(&entry->map_count, 0);
 	}
 
 	return entry;
@@ -529,6 +534,9 @@ static void kgsl_mem_entry_detach_process(struct kgsl_mem_entry *entry)
 	if (entry->id != 0)
 		idr_remove(&entry->priv->mem_idr, entry->id);
 	entry->id = 0;
+
+	atomic64_sub(atomic64_read(&entry->memdesc.mapsize),
+			&entry->priv->gpumem_mapped);
 
 	spin_unlock(&entry->priv->mem_lock);
 
@@ -1053,8 +1061,7 @@ static struct kgsl_process_private *kgsl_process_private_new(
 	idr_init(&private->syncsource_idr);
 
 	/* Allocate a pagetable for the new process object */
-	private->pagetable = kgsl_mmu_getpagetable(&device->mmu,
-							pid_nr(cur_pid));
+	private->pagetable = kgsl_mmu_getpagetable(&device->mmu, pid_nr(cur_pid));
 	if (IS_ERR(private->pagetable)) {
 		int err = PTR_ERR(private->pagetable);
 
@@ -2322,7 +2329,7 @@ static int check_vma(unsigned long hostptr, u64 size)
 	return true;
 }
 
-static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
+static int memdesc_sg_virt(struct kgsl_memdesc *memdesc)
 {
 	int ret = 0;
 	long npages = 0, i;
@@ -2345,13 +2352,13 @@ static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
 	}
 
 	down_read(&current->mm->mmap_sem);
-	if (!check_vma(useraddr, memdesc->size)) {
+	if (!check_vma(memdesc->useraddr, memdesc->size)) {
 		up_read(&current->mm->mmap_sem);
 		ret = -EFAULT;
 		goto out;
 	}
 
-	npages = get_user_pages(useraddr, sglen, write, pages, NULL);
+	npages = get_user_pages(memdesc->useraddr, sglen, write, pages, NULL);
 	up_read(&current->mm->mmap_sem);
 
 	ret = (npages < 0) ? (int)npages : 0;
@@ -2382,7 +2389,6 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 	size_t offset, size_t size)
 {
 	/* Map an anonymous memory chunk */
-	int ret;
 
 	if (size == 0 || offset != 0 ||
 		!IS_ALIGNED(size, PAGE_SIZE))
@@ -2390,25 +2396,23 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 
 	entry->memdesc.pagetable = pagetable;
 	entry->memdesc.size = (uint64_t) size;
+	entry->memdesc.useraddr = hostptr;
 	entry->memdesc.flags |= (uint64_t)KGSL_MEMFLAGS_USERMEM_ADDR;
 
 	if (kgsl_memdesc_use_cpu_map(&entry->memdesc)) {
+		int ret;
+
 		/* Register the address in the database */
 		ret = kgsl_mmu_set_svm_region(pagetable,
-			(uint64_t) hostptr, (uint64_t) size);
+			(uint64_t) entry->memdesc.useraddr, (uint64_t) size);
 
 		if (ret)
 			return ret;
 
-		entry->memdesc.gpuaddr = (uint64_t) hostptr;
+		entry->memdesc.gpuaddr = (uint64_t)  entry->memdesc.useraddr;
 	}
 
-	ret = memdesc_sg_virt(&entry->memdesc, hostptr);
-
-	if (ret && kgsl_memdesc_use_cpu_map(&entry->memdesc))
-		kgsl_mmu_put_gpuaddr(&entry->memdesc);
-
-	return ret;
+	return memdesc_sg_virt(&entry->memdesc);
 }
 
 #ifdef CONFIG_DMA_SHARED_BUFFER
@@ -2493,7 +2497,8 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 		return ret;
 	}
 
-	/* Setup the cache mode for cache operations */
+	/* Setup the user addr/cache mode for cache operations */
+	entry->memdesc.useraddr = hostptr;
 	_setup_cache_mode(entry, vma);
 	up_read(&current->mm->mmap_sem);
 	return 0;
@@ -3519,12 +3524,7 @@ long kgsl_ioctl_gpumem_get_info(struct kgsl_device_private *dev_priv,
 	param->flags = (unsigned int) entry->memdesc.flags;
 	param->size = (size_t) entry->memdesc.size;
 	param->mmapsize = (size_t) kgsl_memdesc_footprint(&entry->memdesc);
-	/*
-	 * Entries can have multiple user mappings so thre isn't any one address
-	 * we can report. Plus, the user should already know their mappings, so
-	 * there isn't any value in reporting it back to them.
-	 */
-	param->useraddr = 0;
+	param->useraddr = entry->memdesc.useraddr;
 
 	kgsl_mem_entry_put(entry);
 	return result;
@@ -3997,6 +3997,9 @@ static int _sparse_bind(struct kgsl_process_private *process,
 	if (memdesc->gpuaddr)
 		return -EINVAL;
 
+	if (memdesc->useraddr != 0)
+		return -EINVAL;
+
 	pagetable = memdesc->pagetable;
 
 	/* Clear out any mappings */
@@ -4277,12 +4280,7 @@ long kgsl_ioctl_gpuobj_info(struct kgsl_device_private *dev_priv,
 	param->flags = entry->memdesc.flags;
 	param->size = entry->memdesc.size;
 	param->va_len = kgsl_memdesc_footprint(&entry->memdesc);
-	/*
-	 * Entries can have multiple user mappings so thre isn't any one address
-	 * we can report. Plus, the user should already know their mappings, so
-	 * there isn't any value in reporting it back to them.
-	 */
-	param->va_addr = 0;
+	param->va_addr = (uint64_t) entry->memdesc.useraddr;
 
 	kgsl_mem_entry_put(entry);
 	return 0;
@@ -4389,21 +4387,24 @@ static void kgsl_gpumem_vm_open(struct vm_area_struct *vma)
 
 	if (kgsl_mem_entry_get(entry) == 0)
 		vma->vm_private_data = NULL;
-
-	atomic_inc(&entry->map_count);
 }
 
 static int
 kgsl_gpumem_vm_fault(struct vm_fault *vmf)
 {
 	struct kgsl_mem_entry *entry = vmf->vma->vm_private_data;
+	int ret;
 
 	if (!entry)
 		return VM_FAULT_SIGBUS;
 	if (!entry->memdesc.ops || !entry->memdesc.ops->vmfault)
 		return VM_FAULT_SIGBUS;
 
-	return entry->memdesc.ops->vmfault(&entry->memdesc, vmf->vma, vmf);
+	ret = entry->memdesc.ops->vmfault(&entry->memdesc, vmf->vma, vmf);
+	if ((ret == 0) || (ret == VM_FAULT_NOPAGE))
+		atomic64_add(PAGE_SIZE, &entry->priv->gpumem_mapped);
+
+	return ret;
 }
 
 static void
@@ -4414,13 +4415,7 @@ kgsl_gpumem_vm_close(struct vm_area_struct *vma)
 	if (!entry)
 		return;
 
-	/*
-	 * Remove the memdesc from the mapped stat once all the mappings have
-	 * gone away
-	 */
-	if (!atomic_dec_return(&entry->map_count))
-		atomic64_sub(entry->memdesc.size, &entry->priv->gpumem_mapped);
-
+	entry->memdesc.useraddr = 0;
 	kgsl_mem_entry_put(entry);
 }
 
@@ -4459,8 +4454,7 @@ get_mmap_entry(struct kgsl_process_private *private,
 		}
 	}
 
-	/* Don't allow ourselves to remap user memory */
-	if (entry->memdesc.flags & KGSL_MEMFLAGS_USERMEM_ADDR) {
+	if (entry->memdesc.useraddr != 0) {
 		ret = -EBUSY;
 		goto err_put;
 	}
@@ -4543,13 +4537,29 @@ static unsigned long _gpu_find_svm(struct kgsl_process_private *private,
 }
 
 /* Search top down in the CPU VM region for a free address */
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+/* 
+ * get the unmap area from resrved area
+ */
+static unsigned long _cpu_get_unmapped_area(unsigned long bottom,
+		unsigned long top, unsigned long len, unsigned long align,
+		unsigned long mmap_flags)
+#else
 static unsigned long _cpu_get_unmapped_area(unsigned long bottom,
 		unsigned long top, unsigned long len, unsigned long align)
+#endif
 {
 	struct vm_unmapped_area_info info;
 	unsigned long addr, err;
 
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+	/* 
+	 * get the unmap area from resrved area
+	 */
+	info.flags = VM_UNMAPPED_AREA_TOPDOWN|mmap_flags;
+#else
 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+#endif
 	info.low_limit = bottom;
 	info.high_limit = top;
 	info.length = len;
@@ -4565,17 +4575,32 @@ static unsigned long _cpu_get_unmapped_area(unsigned long bottom,
 	return err ? err : addr;
 }
 
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+/* 
+ * get unmaped area from normal or reserved vma, decide by mmap_flags
+ */
+static unsigned long _search_range(struct kgsl_process_private *private,
+		struct kgsl_mem_entry *entry,
+		unsigned long start, unsigned long end,
+		unsigned long len, uint64_t align, unsigned long mmap_flags)
+#else
 static unsigned long _search_range(struct kgsl_process_private *private,
 		struct kgsl_mem_entry *entry,
 		unsigned long start, unsigned long end,
 		unsigned long len, uint64_t align)
+#endif
 {
 	unsigned long cpu, gpu = end, result = -ENOMEM;
 
 	while (gpu > start) {
 		/* find a new empty spot on the CPU below the last one */
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+		cpu = _cpu_get_unmapped_area(start, gpu, len,
+				(unsigned long) align, mmap_flags);
+#else
 		cpu = _cpu_get_unmapped_area(start, gpu, len,
 			(unsigned long) align);
+#endif
 		if (IS_ERR_VALUE(cpu)) {
 			result = cpu;
 			break;
@@ -4679,6 +4704,13 @@ static unsigned long _get_svm_area(struct kgsl_process_private *private,
 
 		vma = find_vma(current->mm, addr);
 
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+		/* 
+		 * while vma is NULL, check whether the addr is valid in
+		 * reserve area or not.
+		 */
+		try_reserved_region(vma, addr, len, private, entry, result);
+#else
 		if (vma == NULL || ((addr + len) <= vma->vm_start)) {
 			result = _gpu_set_svm_region(private, entry, addr, len);
 
@@ -4686,6 +4718,7 @@ static unsigned long _get_svm_area(struct kgsl_process_private *private,
 			if (!IS_ERR_VALUE(result))
 				return result;
 		}
+#endif
 	} else {
 		/* no hint, start search at the top and work down */
 		addr = end & ~(align - 1);
@@ -4695,9 +4728,16 @@ static unsigned long _get_svm_area(struct kgsl_process_private *private,
 	 * Search downwards from the hint first. If that fails we
 	 * must try to search above it.
 	 */
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+	/*
+	 * try to get unmap area from reserved area
+	 */
+	result = kgsl_search_range(private, entry, start, end, addr, len, align, hint, _search_range);
+#else
 	result = _search_range(private, entry, start, addr, len, align);
 	if (IS_ERR_VALUE(result) && hint != 0)
 		result = _search_range(private, entry, addr, end, len, align);
+#endif
 
 	return result;
 }
@@ -4742,6 +4782,12 @@ kgsl_get_unmapped_area(struct file *file, unsigned long addr,
 				pid_nr(private->pid),
 				current->mm->mmap_base, addr,
 				pgoff, len, (int) val);
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+		/* 
+		 * record the process pid and svm_oom happend jiffies
+		 */
+		record_svm_oom_info(val);
+#endif
 	}
 
 put:
@@ -4813,15 +4859,15 @@ static int kgsl_mmap(struct file *file, struct vm_area_struct *vma)
 			vm_insert_page(vma, addr, page);
 			addr += PAGE_SIZE;
 		}
+		atomic64_add(m->size, &m->mapsize);
+		atomic64_add(m->size, &entry->priv->gpumem_mapped);
 	}
 
 	vma->vm_file = file;
 
-	if (atomic_inc_return(&entry->map_count) == 1)
-		atomic64_add(entry->memdesc.size,
-				&entry->priv->gpumem_mapped);
+	entry->memdesc.useraddr = vma->vm_start;
 
-	trace_kgsl_mem_mmap(entry, vma->vm_start);
+	trace_kgsl_mem_mmap(entry);
 	return 0;
 }
 

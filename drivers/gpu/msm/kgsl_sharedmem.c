@@ -1,4 +1,4 @@
-/* Copyright (c) 2002,2007-2021, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2002,2007-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -303,6 +303,14 @@ void kgsl_process_init_sysfs(struct kgsl_device *device,
 	}
 }
 
+#ifdef OPLUS_FEATURE_HEALTHINFO
+//Jiheng.Xie@TECH.BSP.Performance, 2019-07-22, add for gpu total used account
+unsigned long gpu_total(void)
+{
+	return (unsigned long)atomic_long_read(&kgsl_driver.stats.page_alloc);
+}
+#endif /* OPLUS_FEATURE_HEALTHINFO */
+
 static ssize_t kgsl_drv_memstat_show(struct device *dev,
 				 struct device_attribute *attr,
 				 char *buf)
@@ -452,6 +460,8 @@ static int kgsl_page_alloc_vmfault(struct kgsl_memdesc *memdesc,
 
 		get_page(page);
 		vmf->page = page;
+
+		atomic64_add(PAGE_SIZE, &memdesc->mapsize);
 
 		return 0;
 	}
@@ -621,6 +631,8 @@ static int kgsl_contiguous_vmfault(struct kgsl_memdesc *memdesc,
 		return VM_FAULT_OOM;
 	else if (ret == -EFAULT)
 		return VM_FAULT_SIGBUS;
+
+	atomic64_add(PAGE_SIZE, &memdesc->mapsize);
 
 	return VM_FAULT_NOPAGE;
 }
