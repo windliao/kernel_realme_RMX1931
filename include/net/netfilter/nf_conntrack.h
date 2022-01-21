@@ -93,9 +93,7 @@ struct nf_conn {
 #if IS_ENABLED(CONFIG_NF_NAT)
 	struct hlist_node	nat_bysource;
 #endif
-	/* all members below initialized via memset */
 	struct { } __nfct_init_offset;
-
 	/* If we were expected by an expectation, this will be it */
 	struct nf_conn *master;
 
