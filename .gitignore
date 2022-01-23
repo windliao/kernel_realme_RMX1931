@@ -9,6 +9,10 @@
 #
 # Normal rules (sorted alphabetically)
 #
+AnyKernel3
+build-log.txt
+build.sh
+out
 .*
 *.a
 *.bin
